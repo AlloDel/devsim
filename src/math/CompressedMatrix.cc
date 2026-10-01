@@ -81,12 +81,6 @@ void CompressedMatrix<DoubleType>::DebugMatrix(std::ostream &os) const
 template <typename DoubleType>
 CompressedMatrix<DoubleType>::CompressedMatrix(size_t sz, MatrixType mt, CompressionType ct) : Matrix<DoubleType>(sz), matType_(mt), compressionType_(ct), compressed(false), symbolicstatus_(SymbolicStatus_t::NEW_SYMBOLIC)
 {
-  Symbolic_.resize(this->size());
-  OutOfBandEntries_Real.resize(this->size());
-  if (GetMatrixType() == MatrixType::COMPLEX)
-  {
-    OutOfBandEntries_Imag.resize(this->size());
-  }
 }
 
 template <typename DoubleType>
@@ -94,73 +88,90 @@ CompressedMatrix<DoubleType>::~CompressedMatrix()
 {
 }
 
-/*
-*/
 template <typename DoubleType>
-void CompressedMatrix<DoubleType>::AddSymbolicImpl(int r, int c)
+size_t CompressedMatrix<DoubleType>::FindEntry(int r, int c) const
 {
-  /// remember compressed column
-  /// need to make it possible to add out of band entries
-#ifndef NDEBUG
-  dsAssert(!compressed, "UNEXPECTED");
-#endif
-  Symbolic_[c].insert(std::make_pair(r, 0)); // should create implicit entry
+  const auto cbegin = Ai_.begin() + Ap_[c];
+  const auto cend   = Ai_.begin() + Ap_[c + 1];
+  const auto it     = std::lower_bound(cbegin, cend, r);
+  if ((it != cend) && (*it == r))
+  {
+    return static_cast<size_t>(it - Ai_.begin());
+  }
+  return npos;
 }
 
-/// Create Matrix from symbolic info
+/// Create Matrix from the pending entries
 template <typename DoubleType>
 void CompressedMatrix<DoubleType>::CreateMatrix()
 {
-  const size_t cols = Symbolic_.size();
-#ifndef NDEBUG
-  dsAssert(cols == this->size(), "UNEXPECTED");
-#endif
+  const size_t cols = this->size();
+  const bool   is_complex = (GetMatrixType() == MatrixType::COMPLEX);
 
-  Ap_.resize(this->size()+1);
-  Ai_.clear();
-  Ai_.reserve(this->size());
-
-  int r=0;
-  for (size_t c=0; c < cols;  ++c)
+  /// number of pending entries in each column, then the start of each column
+  std::vector<size_t> cstart(cols + 1);
+  for (const auto &e : Pending_Real)
   {
-    Ap_[c]=r;
+    ++cstart[e.col + 1];
+  }
+  for (const auto &e : Pending_Imag)
+  {
+    ++cstart[e.col + 1];
+  }
+  for (size_t c = 0; c < cols; ++c)
+  {
+    cstart[c + 1] += cstart[c];
+  }
 
-    RowInd &rivec = Symbolic_[c];
-    RowInd::iterator iter = rivec.begin();
-    RowInd::iterator iend = rivec.end();
-
-    int rb = r;
-
-    for (; iter != iend; ++iter)
+  /// the rows of the pending entries, column by column
+  IntVec_t rows(cstart[cols]);
+  {
+    std::vector<size_t> cnext(cstart.begin(), cstart.end() - 1);
+    for (const auto &e : Pending_Real)
     {
-      Ai_.push_back((*iter).first);
-      ++r;
+      rows[cnext[e.col]++] = e.row;
     }
-
-    if (r > rb)
+    for (const auto &e : Pending_Imag)
     {
-      IntVec_t::iterator abegin = Ai_.begin();
-      std::advance(abegin, rb);
-      std::sort(abegin, Ai_.end());
-    }
-
-    for (int i = rb; i < r; ++i)
-    {
-      rivec[Ai_[i]] = i;
-//        (*iter).second = r; // gives us the position in Ai,Ax
+      rows[cnext[e.col]++] = e.row;
     }
   }
-  Ap_[this->size()] = r;
+
+  /// each row once and in order: this is the pattern
+  Ap_.resize(cols + 1);
+  Ai_.clear();
+  Ai_.reserve(cols);
+  for (size_t c = 0; c < cols; ++c)
+  {
+    Ap_[c] = static_cast<int>(Ai_.size());
+    const auto rbegin = rows.begin() + cstart[c];
+    const auto rend   = rows.begin() + cstart[c + 1];
+    std::sort(rbegin, rend);
+    Ai_.insert(Ai_.end(), rbegin, std::unique(rbegin, rend));
+  }
+  Ap_[cols] = static_cast<int>(Ai_.size());
 
   // Ye old swap trick
   IntVec_t(Ai_).swap(Ai_);
   // reserve room
   Ax_.clear();
   Ax_.resize(Ai_.size());
-  if (GetMatrixType() == MatrixType::COMPLEX) {
+  if (is_complex) {
     Az_.clear();
     Az_.resize(Ai_.size());
   }
+
+  /// the values, in the order that they were added
+  for (const auto &e : Pending_Real)
+  {
+    Ax_[FindEntry(e.row, e.col)] += e.value;
+  }
+  for (const auto &e : Pending_Imag)
+  {
+    Az_[FindEntry(e.row, e.col)] += e.value;
+  }
+  PendingEntries().swap(Pending_Real);
+  PendingEntries().swap(Pending_Imag);
 
   compressed = true;
 }
@@ -272,27 +283,16 @@ void CompressedMatrix<DoubleType>::AddEntryImpl(int r, int c, DoubleType v)
 
   if (compressed)
   {
-    /// need to adapt for handling of out of band entries
-    /// and recompressing matrix
-    const RowInd &ri = Symbolic_[c];
-    RowInd::const_iterator rit = ri.find(r);
-    if (rit != ri.end())
+    const size_t pos = FindEntry(r, c);
+    if (pos != npos)
     {
-      Ax_[rit->second] += v;
+      Ax_[pos] += v;
+      return;
     }
-    else
-    {
-      DecompressMatrix();
-      AddSymbolicImpl(r, c);
-      OutOfBandEntries_Real[r][c] += v;
-    }
+    /// the entry is outside of the pattern: recompress the matrix at the next Finalize
+    DecompressMatrix();
   }
-  else
-  {
-    AddSymbolicImpl(r, c);
-    /// the double entry is initialized to zero (property of map)
-    OutOfBandEntries_Real[r][c] += v;
-  }
+  Pending_Real.push_back({r, c, v});
 }
 
 template <typename DoubleType>
@@ -325,25 +325,15 @@ void CompressedMatrix<DoubleType>::AddImagEntryImpl(int r, int c, DoubleType v)
 
   if (compressed)
   {
-    const RowInd &ri = Symbolic_[c];
-    RowInd::const_iterator rit = ri.find(r);
-    if (rit != ri.end())
+    const size_t pos = FindEntry(r, c);
+    if (pos != npos)
     {
-      Az_[rit->second] += v;
+      Az_[pos] += v;
+      return;
     }
-    else
-    {
-      DecompressMatrix();
-      AddSymbolicImpl(r, c);
-      OutOfBandEntries_Imag[r][c] += v;
-    }
+    DecompressMatrix();
   }
-  else
-  {
-    AddSymbolicImpl(r, c);
-    /// the double entry is initialized to zero (property of map)
-    OutOfBandEntries_Imag[r][c] += v;
-  }
+  Pending_Imag.push_back({r, c, v});
 }
 
 template <typename DoubleType>
@@ -395,13 +385,15 @@ void CompressedMatrix<DoubleType>::DecompressMatrix()
 #endif
 
   /// size is 1 past in compressed column
+  /// every entry stays in the pattern, also when its value is zero
+  Pending_Real.reserve(Pending_Real.size() + Ai_.size() + 1);
   for (size_t i = 0; i < sz; ++i)
   {
     const size_t beg = Ap_[i];
     const size_t end = Ap_[i+1];
     for (size_t j = beg; j < end; ++ j)
     {
-      AddEntryImpl(Ai_[j], i, Ax_[j]);
+      Pending_Real.push_back({Ai_[j], static_cast<int>(i), Ax_[j]});
     }
     if (GetMatrixType() == MatrixType::COMPLEX)
     {
@@ -410,7 +402,7 @@ void CompressedMatrix<DoubleType>::DecompressMatrix()
         const auto &z = Az_[j];
         if (z != DTZERO)
         {
-          AddImagEntryImpl(Ai_[j], i, z);
+          Pending_Imag.push_back({Ai_[j], static_cast<int>(i), z});
         }
       }
     }
@@ -429,32 +421,6 @@ void CompressedMatrix<DoubleType>::Finalize()
     symbolicstatus_ = SymbolicStatus_t::NEW_SYMBOLIC;
 
     CreateMatrix();
-    for (size_t i = 0; i < OutOfBandEntries_Real.size(); ++i)
-    {
-      typename ColValueEntry::iterator it = OutOfBandEntries_Real[i].begin();
-      const typename ColValueEntry::iterator itend = OutOfBandEntries_Real[i].end();
-      for ( ; it != itend; ++it)
-      {
-        AddEntryImpl(i, it->first, it->second);
-      }
-    }
-    OutOfBandEntries_Real.clear();
-    OutOfBandEntries_Real.resize(this->size());
-
-    if (GetMatrixType() == MatrixType::COMPLEX)
-    {
-      for (size_t i = 0; i < OutOfBandEntries_Imag.size(); ++i)
-      {
-        typename ColValueEntry::iterator it = OutOfBandEntries_Imag[i].begin();
-        const typename ColValueEntry::iterator itend = OutOfBandEntries_Imag[i].end();
-        for ( ; it != itend; ++it)
-        {
-          AddImagEntryImpl(i, it->first, it->second);
-        }
-      }
-      OutOfBandEntries_Imag.clear();
-      OutOfBandEntries_Imag.resize(this->size());
-    }
   }
   else
   {
@@ -475,13 +441,8 @@ void CompressedMatrix<DoubleType>::ClearMatrix()
     Az_.resize(sz);
   }
 
-  OutOfBandEntries_Real.clear();
-  OutOfBandEntries_Real.resize(sz);
-  if (GetMatrixType() == MatrixType::COMPLEX)
-  {
-    OutOfBandEntries_Imag.clear();
-    OutOfBandEntries_Imag.resize(sz);
-  }
+  Pending_Real.clear();
+  Pending_Imag.clear();
 }
 
 namespace {

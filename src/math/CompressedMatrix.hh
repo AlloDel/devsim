@@ -12,9 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 #include "dsMathTypes.hh"
 
 #include<utility>
-#include<map>
 #include<vector>
-#include<unordered_map>
 
 #include <iosfwd>
 
@@ -29,12 +27,16 @@ template <typename DoubleType>
 class CompressedMatrix : public Matrix<DoubleType> {
     public:
 
-        typedef std::unordered_map<int, int >         RowInd;
         typedef std::pair<int, int >        RowColEntry;
         typedef std::vector<RowColEntry>    RowColEntryVec;
-        typedef std::vector<RowInd >        SymbolicMat;
-        typedef std::map<int, DoubleType>       ColValueEntry;
-        typedef std::vector<ColValueEntry > RowColValueEntries;
+
+        /// An entry that waits for the next compression: its value is added in the order of arrival
+        struct PendingEntry {
+            int        row;
+            int        col;
+            DoubleType value;
+        };
+        typedef std::vector<PendingEntry>   PendingEntries;
 
         void AddEntry(int, int, DoubleType);  // add row,column, value
 
@@ -92,7 +94,8 @@ class CompressedMatrix : public Matrix<DoubleType> {
         void DecompressMatrix();
 
     private:
-        void AddSymbolicImpl(int, int);  // add row,column to element list
+        /// position of row,column in Ai,Ax of the compressed matrix, or npos when it is outside of the pattern
+        size_t FindEntry(int, int) const;
         void AddEntryImpl(int, int, DoubleType);  // add row,column, value
         //void AddEntryImpl(int, int, ComplexDouble_t<DoubleType>);
         void AddImagEntryImpl(int, int, DoubleType);  // add row,column, value
@@ -105,10 +108,11 @@ class CompressedMatrix : public Matrix<DoubleType> {
         MatrixType      matType_;
         CompressionType compressionType_;
 
+        //// Entries added while the matrix is not compressed
+        PendingEntries      Pending_Real;
+        PendingEntries      Pending_Imag;
         //// These should be properties of a compressed column matrix, just not a regular matrix
-        SymbolicMat         Symbolic_;
-        RowColValueEntries  OutOfBandEntries_Real;
-        RowColValueEntries  OutOfBandEntries_Imag;
+        //// The rows of each column are sorted in Ai_
         IntVec_t    Ap_;
         IntVec_t    Ai_;
         //// Should these just be one complex vector
@@ -119,6 +123,7 @@ class CompressedMatrix : public Matrix<DoubleType> {
         SymbolicStatus_t symbolicstatus_;
 
         static const inline DoubleType DTZERO{};
+        static const size_t npos = static_cast<size_t>(-1);
 };
 
 }
